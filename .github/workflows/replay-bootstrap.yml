@@ -1,0 +1,77 @@
+# Temporary integration job. Removed when the validated engine-hook blobs are committed.
+name: Replay integration build
+on:
+  push:
+    branches: [feature/spawn-replay-bots]
+permissions:
+  contents: write
+concurrency:
+  group: replay-integration-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  integrate:
+    if: github.repository == 'pstngh/openmohaa-recordtest' && github.ref == 'refs/heads/feature/spawn-replay-bots'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Apply the reviewed narrow engine hooks
+        run: |
+          git apply --check tools/replay/integration.patch
+          git apply tools/replay/integration.patch
+      - name: Build and run replay tests
+        run: |
+          cmake -S tools/replay -B build-replay-tests
+          cmake --build build-replay-tests --parallel 2
+          ctest --test-dir build-replay-tests --output-on-failure
+      - name: Install engine build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build flex bison libsdl2-dev libopenal-dev libcurl4-openssl-dev
+      - name: Build dedicated server and game modules
+        run: |
+          cmake -S . -B build-replay -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_CLIENT=OFF -DBUILD_RENDERER_GL1=OFF -DBUILD_RENDERER_GL2=OFF -DBUILD_GAME_QVMS=OFF
+          cmake --build build-replay --parallel 2
+          ctest --test-dir build-replay --output-on-failure
+      - name: Store validated engine-hook blobs without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, tarfile, urllib.request
+          repository = os.environ['GITHUB_REPOSITORY']
+          assert repository == 'pstngh/openmohaa-recordtest'
+          assert os.environ['GITHUB_REF'] == 'refs/heads/feature/spawn-replay-bots'
+          files = ['code/fgame/player.cpp', 'code/fgame/player.h', 'code/fgame/playerbot.cpp']
+          changes = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert set(changes) == set(files), changes
+          output = {'base_commit': os.environ['GITHUB_SHA'], 'files': []}
+          for name in files:
+              content = pathlib.Path(name).read_bytes()
+              payload = json.dumps({'content': base64.b64encode(content).decode(), 'encoding': 'base64'}).encode()
+              request = urllib.request.Request('https://api.github.com/repos/' + repository + '/git/blobs', data=payload,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',
+                           'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28'}, method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              expected = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+              assert result['sha'] == expected
+              output['files'].append({'path': name, 'sha': result['sha']})
+          pathlib.Path('replay-integration.json').write_text(json.dumps(output, indent=2))
+          with tarfile.open('replay-validated-source.tar.gz', 'w:gz') as archive:
+              for name in files + ['code/fgame/g_replay.cpp', 'code/fgame/g_replay.h', 'code/fgame/replay_track.cpp',
+                                   'code/fgame/replay_track.h', 'tools/replay', 'docs/spawn-replay-bots.md']:
+                  archive.add(name)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-integration
+          path: |
+            replay-integration.json
+            replay-validated-source.tar.gz
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-linux-debug
+          path: build-replay/Debug/
+          retention-days: 7

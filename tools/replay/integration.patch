@@ -1,0 +1,176 @@
+diff --git a/code/fgame/player.cpp b/code/fgame/player.cpp
+index 48407b1..d486904 100644
+--- a/code/fgame/player.cpp
++++ b/code/fgame/player.cpp
+@@ -28,6 +28,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ #include "entity.h"
+ #include "consoleevent.h"
+ #include "player.h"
++#include "g_replay.h"
+ #include "worldspawn.h"
+ #include "weapon.h"
+ #include "trigger.h"
+@@ -3765,6 +3766,7 @@ pmtype_t Player::GetMovePlayerMoveType(void)
+ 
+ void Player::CheckGround(void)
+ {
++    if (G_ReplayLocked(this)) return;
+     pmove_t pm;
+ 
+     SetMoveInfo(&pm, current_ucmd);
+@@ -3774,6 +3776,10 @@ void Player::CheckGround(void)
+ 
+ qboolean Player::AnimMove(Vector& move, Vector *endpos)
+ {
++    if (G_ReplayLocked(this)) {
++        if (endpos) *endpos = origin;
++        return qtrue;
++    }
+     Vector  up;
+     Vector  down;
+     trace_t trace;
+@@ -3969,6 +3975,7 @@ float Player::CheckMoveDist(Vector& move)
+ 
+ void Player::ClientMove(usercmd_t *ucmd)
+ {
++    if (G_ReplayClientMove(this, ucmd)) return;
+     pmove_t pm;
+     Vector  move;
+ 
+@@ -4716,6 +4723,7 @@ void Player::Think(void)
+         }
+     }
+ 
++    G_ReplayRestore(this);
+     oldvelocity = velocity;
+     old_v_angle = v_angle;
+ 
+@@ -7808,7 +7816,9 @@ and right after spawning
+ */
+ void Player::EndFrame(void)
+ {
++    G_ReplayRestore(this);
+     FinishMove();
++    G_ReplayRestore(this);
+     UpdateStats();
+     UpdateMusic();
+     UpdateReverb();
+@@ -7823,6 +7833,7 @@ void Player::EndFrame(void)
+             SetupView();
+         }
+     }
++    G_ReplayValidate(this);
+ }
+ 
+ void Player::GotKill(Event *ev)
+@@ -7919,6 +7930,7 @@ void Player::addOrigin(Vector org)
+ 
+ void Player::Jump(Event *ev)
+ {
++    if (G_ReplayLocked(this)) return;
+     float maxheight;
+ 
+     if (m_pTurret || m_pVehicle) {
+@@ -7954,6 +7966,7 @@ void Player::Jump(Event *ev)
+ 
+ void Player::JumpXY(Event *ev)
+ {
++    if (G_ReplayLocked(this)) return;
+     float forwardmove;
+     float sidemove;
+     float distance;
+@@ -12138,7 +12151,7 @@ bool Player::HasVehicle() const
+ 
+ void Player::setContentsSolid()
+ {
+-    edict->r.contents = CONTENTS_BODY;
++    edict->r.contents = G_ReplayLocked(this) ? CONTENTS_WEAPONCLIP : CONTENTS_BODY;
+ }
+ 
+ void Player::UserSelectWeapon(bool bWait)
+diff --git a/code/fgame/player.h b/code/fgame/player.h
+index a458271..086fa79 100644
+--- a/code/fgame/player.h
++++ b/code/fgame/player.h
+@@ -127,6 +127,7 @@ class VoteUpload;
+ 
+ class Player : public Sentient
+ {
++    friend struct ReplayAccess;
+     friend class Camera;
+     friend class Vehicle;
+     friend class TurretGun;
+diff --git a/code/fgame/playerbot.cpp b/code/fgame/playerbot.cpp
+index b2fdde9..a415961 100644
+--- a/code/fgame/playerbot.cpp
++++ b/code/fgame/playerbot.cpp
+@@ -33,6 +33,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ #include "weaputils.h"
+ #include "windows.h"
+ #include "g_bot.h"
++#include "g_replay.h"
+ 
+ // We assume that we have limited access to the server-side
+ // and that most logic come from the playerstate_s structure
+@@ -81,6 +82,7 @@ BotController::BotController()
+ 
+ BotController::~BotController()
+ {
++    G_ReplayForget(controlledEnt);
+     if (controlledEnt) {
+         controlledEnt->delegate_gotKill.Remove(delegateHandle_gotKill);
+         controlledEnt->delegate_killed.Remove(delegateHandle_killed);
+@@ -1202,6 +1204,7 @@ void BotController::UseWeaponWithAmmo()
+ 
+ void BotController::Spawned(void)
+ {
++    G_ReplaySpawned(controlledEnt);
+     ClearEnemy();
+     m_iCuriousTime   = 0;
+     m_botCmd.buttons = 0;
+@@ -1212,15 +1215,18 @@ void BotController::Think()
+     usercmd_t  ucmd;
+     usereyes_t eyeinfo;
+ 
+-    UpdateBotStates();
+-    GetUsercmd(&ucmd);
+-    GetEyeInfo(&eyeinfo);
++    if (!G_ReplayBuildCommand(controlledEnt, &ucmd, &eyeinfo)) {
++        UpdateBotStates();
++        GetUsercmd(&ucmd);
++        GetEyeInfo(&eyeinfo);
++    }
+ 
+     G_ClientThink(controlledEnt->edict, &ucmd, &eyeinfo);
+ }
+ 
+ void BotController::Killed(const Event& ev)
+ {
++    G_ReplayForget(controlledEnt);
+     Entity *attacker;
+ 
+     // send the respawn buttons
+@@ -1316,6 +1322,7 @@ BotController *BotControllerManager::createController(Player *player)
+     controller->setControlledEntity(player);
+ 
+     controllers.AddObject(controller);
++    G_ReplaySpawned(player);
+ 
+     return controller;
+ }
+@@ -1352,6 +1359,7 @@ BotControllerManager::~BotControllerManager()
+ 
+ void BotControllerManager::Init()
+ {
++    G_ReplayInit();
+     BotController::Init();
+ }
+ 
+@@ -1367,6 +1375,7 @@ void BotControllerManager::Cleanup()
+     }
+ 
+     controllers.FreeObjectList();
++    G_ReplayShutdown();
+ }
+ 
+ void BotControllerManager::ThinkControllers()
