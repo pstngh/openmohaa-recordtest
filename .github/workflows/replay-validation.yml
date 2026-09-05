@@ -1,0 +1,41 @@
+name: Replay validation
+
+on:
+  push:
+    branches: [feature/spawn-replay-bots]
+  pull_request:
+    paths:
+      - 'code/fgame/*replay*'
+      - 'tools/replay/**'
+      - '.github/workflows/replay-validation.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: replay-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive exact source for reproducible validation
+        run: git archive --format=tar HEAD > replay-source.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-source
+          path: replay-source.tar
+          retention-days: 7
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build flex bison libsdl2-dev libopenal-dev libcurl4-openssl-dev
+      - name: Configure dedicated server and game module
+        run: cmake -S . -B build-replay -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_CLIENT=OFF -DBUILD_RENDERER_GL1=OFF -DBUILD_RENDERER_GL2=OFF -DBUILD_GAME_QVMS=OFF
+      - name: Build
+        run: cmake --build build-replay --parallel 2
+      - name: Test
+        run: ctest --test-dir build-replay --output-on-failure
