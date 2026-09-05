@@ -28,6 +28,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "entity.h"
 #include "consoleevent.h"
 #include "player.h"
+#include "g_replay.h"
 #include "worldspawn.h"
 #include "weapon.h"
 #include "trigger.h"
@@ -3765,6 +3766,7 @@ pmtype_t Player::GetMovePlayerMoveType(void)
 
 void Player::CheckGround(void)
 {
+    if (G_ReplayLocked(this)) return;
     pmove_t pm;
 
     SetMoveInfo(&pm, current_ucmd);
@@ -3774,6 +3776,10 @@ void Player::CheckGround(void)
 
 qboolean Player::AnimMove(Vector& move, Vector *endpos)
 {
+    if (G_ReplayLocked(this)) {
+        if (endpos) *endpos = origin;
+        return qtrue;
+    }
     Vector  up;
     Vector  down;
     trace_t trace;
@@ -3969,6 +3975,7 @@ float Player::CheckMoveDist(Vector& move)
 
 void Player::ClientMove(usercmd_t *ucmd)
 {
+    if (G_ReplayClientMove(this, ucmd)) return;
     pmove_t pm;
     Vector  move;
 
@@ -4716,6 +4723,7 @@ void Player::Think(void)
         }
     }
 
+    G_ReplayRestore(this);
     oldvelocity = velocity;
     old_v_angle = v_angle;
 
@@ -7808,7 +7816,9 @@ and right after spawning
 */
 void Player::EndFrame(void)
 {
+    G_ReplayRestore(this);
     FinishMove();
+    G_ReplayRestore(this);
     UpdateStats();
     UpdateMusic();
     UpdateReverb();
@@ -7823,6 +7833,7 @@ void Player::EndFrame(void)
             SetupView();
         }
     }
+    G_ReplayValidate(this);
 }
 
 void Player::GotKill(Event *ev)
@@ -7919,6 +7930,7 @@ void Player::addOrigin(Vector org)
 
 void Player::Jump(Event *ev)
 {
+    if (G_ReplayLocked(this)) return;
     float maxheight;
 
     if (m_pTurret || m_pVehicle) {
@@ -7954,6 +7966,7 @@ void Player::Jump(Event *ev)
 
 void Player::JumpXY(Event *ev)
 {
+    if (G_ReplayLocked(this)) return;
     float forwardmove;
     float sidemove;
     float distance;
@@ -12138,7 +12151,7 @@ bool Player::HasVehicle() const
 
 void Player::setContentsSolid()
 {
-    edict->r.contents = CONTENTS_BODY;
+    edict->r.contents = G_ReplayLocked(this) ? CONTENTS_WEAPONCLIP : CONTENTS_BODY;
 }
 
 void Player::UserSelectWeapon(bool bWait)

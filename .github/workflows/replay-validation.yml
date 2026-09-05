@@ -2,10 +2,14 @@ name: Replay validation
 
 on:
   push:
-    branches: [feature/spawn-replay-bots]
+    branches: [main, feature/spawn-replay-bots]
+    paths:
+      - 'code/fgame/**'
+      - 'tools/replay/**'
+      - '.github/workflows/replay-validation.yml'
   pull_request:
     paths:
-      - 'code/fgame/*replay*'
+      - 'code/fgame/**'
       - 'tools/replay/**'
       - '.github/workflows/replay-validation.yml'
 
@@ -24,12 +28,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Apply staged engine hooks when present
-        run: |
-          if [ -f tools/replay/integration.patch ]; then
-            git apply --check tools/replay/integration.patch
-            git apply tools/replay/integration.patch
-          fi
       - name: Replay tests
         run: |
           cmake -S tools/replay -B build-replay-tests
@@ -43,3 +41,8 @@ jobs:
         run: cmake --build build-replay --parallel 2
       - name: Test
         run: ctest --test-dir build-replay --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-linux-debug
+          path: build-replay/Debug/
+          retention-days: 7

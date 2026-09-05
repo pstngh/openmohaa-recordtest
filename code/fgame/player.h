@@ -127,6 +127,7 @@ class VoteUpload;
 
 class Player : public Sentient
 {
+    friend struct ReplayAccess;
     friend class Camera;
     friend class Vehicle;
     friend class TurretGun;

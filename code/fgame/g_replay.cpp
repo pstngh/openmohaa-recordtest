@@ -143,7 +143,7 @@ const char *WeaponModel(const std::string& name) {
         {"Kar98", "kar98"}, {"Springfield '03 Sniper", "springfield"},
         {"Kar98 Sniper", "kar98sniper"}, {"BAR", "bar"}, {"StG 44", "mp44"},
         {"MP44", "mp44"}, {"Bazooka", "bazooka"}, {"Panzerschreck", "panzerschreck"},
-        {"Shotgun", "shotgun"}, {"Colt .45", "colt45"}, {"Walther P38", "p38"},
+        {"Shotgun", "shotgun"}, {"Colt 45", "colt45"}, {"Colt .45", "colt45"}, {"Walther P38", "p38"},
         {"Frag Grenade", "m2frag_grenade"}, {"Stielhandgranate", "steilhandgranate"}
     };
     for (const auto& entry : models) if (!Q_stricmp(name.c_str(), entry.first)) return entry.second;
@@ -384,6 +384,7 @@ bool G_ReplayBuildCommand(Player *p, usercmd_t *cmd, usereyes_t *eyes) {
             Hold(state, "playback clock discontinuity");
         } else if (elapsed >= static_cast<int>(clip.duration)) {
             state.finished = true;
+            state.frame.forward = state.frame.right = state.frame.up = 0;
             state.frame.velocity = {};
             state.frame.buttons = 0;
             // Reset a living replay endpoint without old damage, fake kill credit or forced round respawns.
@@ -392,7 +393,7 @@ bool G_ReplayBuildCommand(Player *p, usercmd_t *cmd, usereyes_t *eyes) {
                 p->Respawn(nullptr);
                 return G_ReplayBuildCommand(p, cmd, eyes);
             }
-        } else if (p->HasVehicle() || p->GetTurret() || p->GetLadder() || p->m_bFrozen) {
+        } else if (p->HasVehicle() || p->GetTurret() || p->GetLadder() || p->m_bFrozen || level.playerfrozen) {
             Hold(state, "unsupported attachment or scripted freeze");
         } else {
             auto next = replay::Sample(clip, static_cast<std::uint32_t>(elapsed));
