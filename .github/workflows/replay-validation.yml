@@ -28,6 +28,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Archive exact source
+        run: git archive --format=tar HEAD > replay-source.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-source
+          path: replay-source.tar
+          retention-days: 7
       - name: Replay tests
         run: |
           cmake -S tools/replay -B build-replay-tests
