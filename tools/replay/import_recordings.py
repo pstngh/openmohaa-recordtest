@@ -22,7 +22,7 @@ import struct
 import sys
 import tempfile
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 FRAME = struct.Struct('<I18fI3i3If')
 assert FRAME.size == 108
@@ -98,6 +98,65 @@ class Life:
     stopped: bool = False
     rejected: str = ''
     synthetic_start: bool = False
+
+
+@dataclass(frozen=True)
+class QualityFilters:
+    """Reject entire lives, never trim pauses or retime their recorded actions."""
+    min_duration_ms: int = 10_000
+    max_stationary_ms: int = 3_000
+    max_stationary_fraction: float = 0.60
+    stationary_speed: float = 10.0
+
+    def validate(self):
+        for name in ('min_duration_ms', 'max_stationary_ms'):
+            value = getattr(self, name)
+            minimum = 1 if name == 'min_duration_ms' else 0
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f'{name} must be an integer >= {minimum}')
+        if not math.isfinite(self.max_stationary_fraction) or not 0 <= self.max_stationary_fraction <= 1:
+            raise ValueError('max_stationary_fraction must be finite and between 0 and 1')
+        if not math.isfinite(self.stationary_speed) or self.stationary_speed < 0:
+            raise ValueError('stationary_speed must be finite and nonnegative')
+
+
+def activity_metrics(frames: list, duration: int, stationary_speed: float) -> dict:
+    """Measure playback time, not frame counts, using recorded horizontal positions.
+
+    Looking, shooting, crouching and vertical-only jumps do not count as travel.
+    Speed <= stationary_speed is stationary, so small positional noise does not
+    restart the timer. The sampler holds its final position until duration; that
+    tail is stationary even if the last recorded velocity is nonzero.
+    """
+    stationary_ms = longest_ms = streak_ms = 0
+    distance_xy = 0.0
+    for i, current in enumerate(frames):
+        following = frames[i + 1] if i + 1 < len(frames) else None
+        dt = (following[0] if following else duration) - current[0]
+        travel = math.hypot(following[1] - current[1], following[2] - current[2]) if following else 0.0
+        distance_xy += travel
+        if travel * 1000 <= stationary_speed * dt:
+            stationary_ms += dt
+            streak_ms += dt
+            longest_ms = max(longest_ms, streak_ms)
+        else:
+            streak_ms = 0
+    return {'duration_ms': duration, 'stationary_ms': stationary_ms,
+            'stationary_fraction': stationary_ms / duration,
+            'longest_stationary_ms': longest_ms, 'distance_xy': distance_xy}
+
+
+def quality_reasons(metrics: dict, filters: QualityFilters) -> list[str]:
+    # Keep every failure in the audit report, but count each rejected life once
+    # in the main rejection totals, using this order as the primary reason.
+    reasons = []
+    if metrics['duration_ms'] < filters.min_duration_ms:
+        reasons.append('life_too_short')
+    if filters.max_stationary_ms and metrics['longest_stationary_ms'] > filters.max_stationary_ms:
+        reasons.append('stationary_stretch_too_long')
+    if metrics['stationary_fraction'] > filters.max_stationary_fraction:
+        reasons.append('too_much_stationary_time')
+    return reasons
 
 
 def read_sessions(source, name):
@@ -266,12 +325,20 @@ def encode_library(key, clips, sample_ms):
     return out.getvalue()
 
 
-def import_source(path: Path, output: Path, map_filter=None, include_bots=False, min_duration=500):
+def import_source(path: Path, output: Path, map_filter=None, include_bots=False, min_duration=10_000,
+                  *, max_stationary_ms=3_000, max_stationary_fraction=0.60, stationary_speed=10.0):
+    filters = QualityFilters(min_duration, max_stationary_ms, max_stationary_fraction, stationary_speed)
+    filters.validate()
     source = Source(path)
     groups = collections.defaultdict(list)
     intervals = {}
     report = {'format':'OMRPL001','accepted':0,'rejected':{},'libraries':[],
               'synthetic_start_clips':0,'note':'Positions are float32 CSV samples; lean and between-sample motion are reconstructed.'}
+    report['quality'] = {'settings': asdict(filters), 'candidates': 0, 'accepted': 0,
+                         'rejected': 0, 'failure_counts': {}, 'pools': [], 'clips': []}
+    quality_failures = collections.Counter()
+    # Track spawn coverage before/after quality rejection, including emptied pools.
+    quality_pools = collections.defaultdict(lambda: [0, 0])
     rejected = collections.Counter()
     seen = set()
     try:
@@ -326,7 +393,7 @@ def import_source(path: Path, output: Path, map_filter=None, include_bots=False,
                         continue
                     duration = min(life.end-life.start,
                                    life.frames[-1][0]+intervals[key] if life.frames else 0)
-                    reason = life.rejected or ('short_or_missing_life' if len(life.frames)<2 or duration<min_duration else '')
+                    reason = life.rejected or ('short_or_missing_life' if len(life.frames)<2 else '')
                     if not reason and (duration<=0 or duration>3600000):
                         reason='invalid_duration'
                     if reason:
@@ -341,12 +408,44 @@ def import_source(path: Path, output: Path, map_filter=None, include_bots=False,
                         rejected['duplicate_clip']+=1
                         continue
                     seen.add(clip_id)
+                    metrics = activity_metrics(life.frames, duration, filters.stationary_speed)
+                    failures = quality_reasons(metrics, filters)
+                    report['quality']['clips'].append({
+                        'id': clip_id, 'map': key[0], 'checksum': key[1],
+                        'game_type': key[2], 'protocol': key[3], 'team': life.team,
+                        'spawn': life.spawn, **metrics, 'accepted': not failures,
+                        'reasons': failures})
+                    pool_key = (*key, life.team if key[2] != 1 else 0, *life.spawn)
+                    quality_pools[pool_key][0] += 1
+                    if failures:
+                        rejected[failures[0]] += 1
+                        quality_failures.update(failures)
+                        continue
+                    quality_pools[pool_key][1] += 1
                     groups[key].append((life,duration,clip_id))
                     report['synthetic_start_clips']+=int(life.synthetic_start)
     finally:
         source.close()
+    report['quality']['clips'].sort(key=lambda clip: clip['id'])
+    report['quality']['candidates'] = sum(counts[0] for counts in quality_pools.values())
+    report['quality']['accepted'] = sum(counts[1] for counts in quality_pools.values())
+    report['quality']['rejected'] = report['quality']['candidates'] - report['quality']['accepted']
+    report['quality']['failure_counts'] = dict(sorted(quality_failures.items()))
+    for key, (before, after) in sorted(quality_pools.items()):
+        report['quality']['pools'].append({
+            'map': key[0], 'checksum': key[1], 'game_type': key[2], 'protocol': key[3],
+            'team': key[4], 'spawn': key[5:], 'before': before, 'accepted': after,
+            'rejected': before - after})
     if not groups:
-        raise ValueError('no eligible lives (matching checksum, protocol 8, living frames and spawn needed)')
+        raise ValueError('no eligible lives (matching checksum, protocol 8, living frames, spawn and quality filters needed); '
+                         f'rejections: {dict(sorted(rejected.items()))}. No libraries written; existing output unchanged.')
+    # Never leave a formerly usable map's stale library active when filtering has
+    # removed every candidate from that map. Do not delete users' files either.
+    for key in {pool[:4] for pool in quality_pools} - groups.keys():
+        stale = output / f'{key[0]}.{key[1]}.{key[2]}.rpl'
+        if stale.exists():
+            raise ValueError(f'all lives filtered from {key[0]} but old library exists: {stale}; '
+                             'use a fresh output directory. No libraries written; existing output unchanged.')
     for key,clips in sorted(groups.items()):
         clips.sort(key=lambda clip:clip[2])
         data=encode_library(key,clips,intervals[key])
@@ -375,14 +474,30 @@ def main():
     parser.add_argument('output',type=Path,help='game replays directory, e.g. /games/mohaa/main/replays')
     parser.add_argument('--map',dest='map_filter',help='exact map name, e.g. dm/crnodoors')
     parser.add_argument('--include-bots',action='store_true',help='also import bot lives; default is humans only')
-    parser.add_argument('--min-duration-ms',type=int,default=500)
+    parser.add_argument('--min-duration-ms', type=int, default=10_000,
+                        help='minimum playable life duration in ms (default: 10000)')
+    parser.add_argument('--max-stationary-ms', type=int, default=3_000,
+                        help='maximum continuous stationary stretch in ms; 0 disables (default: 3000)')
+    parser.add_argument('--max-stationary-fraction', type=float, default=0.60,
+                        help='maximum fraction of life spent stationary; 1 disables (default: 0.60)')
+    parser.add_argument('--stationary-speed', type=float, default=10.0,
+                        help='horizontal speed at or below this in game units/sec counts as stationary (default: 10)')
     args=parser.parse_args()
     try:
-        if args.min_duration_ms<1:
-            raise ValueError('minimum duration must be positive')
-        report=import_source(args.input,args.output,args.map_filter,args.include_bots,args.min_duration_ms)
+        report=import_source(args.input,args.output,args.map_filter,args.include_bots,args.min_duration_ms,
+                             max_stationary_ms=args.max_stationary_ms,
+                             max_stationary_fraction=args.max_stationary_fraction,
+                             stationary_speed=args.stationary_speed)
     except (OSError,ValueError,KeyError,zipfile.BadZipFile,configparser.Error) as exc:
         parser.exit(2,f'import failed: {exc}\n')
+    quality = report['quality']
+    print(f"Quality filters retained {quality['accepted']}/{quality['candidates']} candidate lives "
+          f"({quality['rejected']} rejected).")
+    for pool in quality['pools']:
+        if pool['accepted'] == 0:
+            print(f"WARNING: no eligible lives left at {pool['map']} / checksum {pool['checksum']} / "
+                  f"mode {pool['game_type']} / team {pool['team']} / spawn {pool['spawn']}. "
+                  'Replay bots will hold at this spawn; no unrelated route is substituted.', file=sys.stderr)
     print(f"Imported {report['accepted']} lives in {len(report['libraries'])} libraries; see {args.output/'manifest.json'}")
 
 

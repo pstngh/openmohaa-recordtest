@@ -6,6 +6,8 @@ import io
 import json
 from pathlib import Path
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -80,7 +82,11 @@ class ImportTests(unittest.TestCase):
         (folder/f'movement_meta{suffix}.txt').write_text(meta)
 
     def run_import(self, **kwargs):
-        report=imp.import_source(self.source,self.output,min_duration=1,**kwargs)
+        # Structural/segmentation fixtures are intentionally tiny. Quality tests
+        # below exercise production defaults independently.
+        settings = dict(min_duration=1, max_stationary_ms=0, max_stationary_fraction=1)
+        settings.update(kwargs)
+        report=imp.import_source(self.source,self.output,**settings)
         return report,decode(self.output/report['libraries'][0]['file'])
 
     def test_binary_contract(self):
@@ -165,7 +171,7 @@ class ImportTests(unittest.TestCase):
         with zipfile.ZipFile(path,'w') as archive:
             for p in self.source.iterdir():
                 archive.write(p,p.name)
-        report=imp.import_source(path,self.output,min_duration=1)
+        report=imp.import_source(path,self.output,min_duration=1,max_stationary_ms=0,max_stationary_fraction=1)
         self.assertEqual(report['accepted'],1)
 
     def test_zero_time_events_and_end_exclusion(self):
@@ -188,6 +194,212 @@ class ImportTests(unittest.TestCase):
         self.write([frame(0,50,-1),frame(0,100,0),frame(0,150,1)])
         _,lib=self.run_import()
         self.assertEqual([f[0] for f in lib['clips'][0]['frames']],[0,50])
+
+
+class ActivityTests(unittest.TestCase):
+    def metrics(self, points, duration, speed=10):
+        # The analyzer deliberately reads only timestamp and XY, not velocity or aim.
+        return imp.activity_metrics(points, duration, speed)
+
+    def test_motion_is_horizontal_position_not_buttons_velocity_or_aim(self):
+        points = [(0, 0, 0, 1, 200, 0, 0), (500, 0, 0, 60, 200, 0, 180),
+                  (1000, 0, 0, 1, 200, 0, 359)]
+        result = self.metrics(points, 1500)
+        self.assertEqual(result['stationary_ms'], 1500)
+        self.assertEqual(result['longest_stationary_ms'], 1500)
+        self.assertEqual(result['stationary_fraction'], 1)
+        self.assertEqual(result['distance_xy'], 0)
+
+    def test_time_weighting_and_terminal_hold(self):
+        result = self.metrics([(0, 0, 0), (100, 10, 0), (300, 10, 0),
+                               (350, 20, 0), (400, 30, 0)], 500)
+        self.assertEqual(result['stationary_ms'], 300)
+        self.assertEqual(result['longest_stationary_ms'], 200)
+        self.assertEqual(result['stationary_fraction'], .60)
+        self.assertEqual(result['distance_xy'], 30)
+
+    def test_tiny_horizontal_noise_does_not_reset_stationary_timer(self):
+        points = [(t, 0.1 if t % 100 else 0, 0) for t in range(0, 500, 50)]
+        self.assertEqual(self.metrics(points, 500)['longest_stationary_ms'], 500)
+
+    def test_speed_threshold_is_inclusive_and_configurable(self):
+        points = [(0, 0, 0), (100, 1, 0), (200, 2, 0)]
+        self.assertEqual(self.metrics(points, 300, 10)['stationary_ms'], 300)
+        self.assertEqual(self.metrics(points, 300, 9)['stationary_ms'], 100)
+
+    def test_y_axis_strafing_counts_as_motion(self):
+        points = [(0, 0, 0), (100, 0, 10), (200, 0, 0)]
+        result = self.metrics(points, 300)
+        self.assertEqual(result['stationary_ms'], 100)
+        self.assertEqual(result['distance_xy'], 20)
+
+    def test_final_hold_extends_stationary_run(self):
+        result = self.metrics([(0, 0, 0), (100, 10, 0), (200, 10, 0)], 500)
+        self.assertEqual(result['longest_stationary_ms'], 400)
+
+    def test_resampling_constant_speed_does_not_change_time_metrics(self):
+        coarse = [(0, 0, 0), (100, 20, 0), (300, 20, 0), (400, 40, 0)]
+        fine = [(0, 0, 0), (50, 10, 0), (100, 20, 0), (200, 20, 0),
+                (300, 20, 0), (350, 30, 0), (400, 40, 0)]
+        self.assertEqual(self.metrics(coarse, 500), self.metrics(fine, 500))
+
+    def test_threshold_boundaries_and_primary_reason_order(self):
+        filters = imp.QualityFilters()
+        metrics = dict(duration_ms=10000, longest_stationary_ms=3000, stationary_fraction=.60)
+        self.assertEqual(imp.quality_reasons(metrics, filters), [])
+        metrics.update(duration_ms=9999, longest_stationary_ms=3001, stationary_fraction=.6001)
+        self.assertEqual(imp.quality_reasons(metrics, filters),
+                         ['life_too_short', 'stationary_stretch_too_long', 'too_much_stationary_time'])
+
+    def test_nonfinite_or_invalid_settings_are_rejected_before_io(self):
+        for changes in [dict(min_duration=0), dict(min_duration=1.5), dict(min_duration=True),
+                        dict(max_stationary_ms=-1), dict(max_stationary_ms=1.5),
+                        dict(max_stationary_fraction=-.1), dict(max_stationary_fraction=1.1),
+                        dict(max_stationary_fraction=float('nan')), dict(max_stationary_fraction=float('inf')),
+                        dict(stationary_speed=-1), dict(stationary_speed=float('inf')),
+                        dict(stationary_speed=float('nan'))]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                imp.import_source(Path('/nonexistent-recording-input'), Path('/unused-output'), **changes)
+
+
+class QualityImportTests(unittest.TestCase):
+    # Reuse file-writing helpers without inheriting/rerunning the structural tests.
+    setUp = ImportTests.setUp
+    tearDown = ImportTests.tearDown
+    write = ImportTests.write
+
+    def moving(self, client=0, duration=10000, spawn=0):
+        return [frame(client, t, spawn + t / 50) for t in range(0, duration, 50)]
+
+    def test_production_defaults_reject_short_life_accept_exact_ten_seconds(self):
+        frames = self.moving(0, 9950) + self.moving(1, 10000)
+        self.write(frames, [event('spawn', 0, 0), event('spawn', 1, 0)])
+        report = imp.import_source(self.source, self.output)
+        self.assertEqual(report['accepted'], 1)
+        self.assertEqual(report['rejected'], {'life_too_short': 1})
+        self.assertEqual(report['quality']['candidates'], 2)
+        self.assertEqual(report['quality']['settings']['min_duration_ms'], 10000)
+        self.assertEqual(report['quality']['pools'][0]['accepted'], 1)
+
+    def test_initial_stationary_stretch_rejected_without_cutting_or_reanchoring(self):
+        frames = self.moving(0) + [frame(1, t, max(0, t - 3050) / 50) for t in range(0, 10000, 50)]
+        self.write(frames, [event('spawn', 0, 0), event('spawn', 1, 0)])
+        report = imp.import_source(self.source, self.output)
+        self.assertEqual(report['accepted'], 1)
+        self.assertEqual(report['rejected'], {'stationary_stretch_too_long': 1})
+        rejected = next(c for c in report['quality']['clips'] if not c['accepted'])
+        self.assertEqual(rejected['longest_stationary_ms'], 3050)
+        self.assertEqual(rejected['spawn'], (0, 0, 1))
+
+    def test_exactly_three_seconds_stationary_is_allowed(self):
+        self.write([frame(0, t, max(0, t - 3000) / 50) for t in range(0, 10000, 50)],
+                   [event('spawn', 0, 0)])
+        report = imp.import_source(self.source, self.output)
+        self.assertEqual(report['accepted'], 1)
+        self.assertEqual(report['quality']['clips'][0]['longest_stationary_ms'], 3000)
+
+    def test_scattered_stationary_time_rejected_even_without_long_pause(self):
+        x = 0
+        frames = self.moving(0)
+        for t in range(0, 10000, 50):
+            frames.append(frame(1, t, x))
+            # 75% stationary, with each stationary stretch under three seconds.
+            if t % 2000 >= 1500:
+                x += 1
+        self.write(frames, [event('spawn', 0, 0), event('spawn', 1, 0)])
+        report = imp.import_source(self.source, self.output)
+        self.assertEqual(report['rejected'], {'too_much_stationary_time': 1})
+        rejected = next(c for c in report['quality']['clips'] if not c['accepted'])
+        self.assertLess(rejected['longest_stationary_ms'], 3000)
+        self.assertGreater(rejected['stationary_fraction'], .60)
+
+    def test_stationary_clip_has_all_failures_but_counts_only_once(self):
+        frames = self.moving(0) + [frame(1, t, 0) for t in range(0, 10000, 50)]
+        self.write(frames, [event('spawn', 0, 0), event('spawn', 1, 0)])
+        report = imp.import_source(self.source, self.output)
+        self.assertEqual(report['quality']['rejected'], 1)
+        self.assertEqual(sum(report['rejected'].values()), 1)
+        self.assertEqual(report['quality']['failure_counts'],
+                         {'stationary_stretch_too_long': 1, 'too_much_stationary_time': 1})
+
+    def test_accepted_binary_samples_actions_and_ids_are_unchanged(self):
+        self.write(self.moving(), [event('spawn', 0, 0), event('reload', 0, 3500), event('shot', 0, 6500)])
+        report = imp.import_source(self.source, self.output)
+        path = self.output / report['libraries'][0]['file']
+        expected = path.read_bytes()
+        relaxed = self.root / 'relaxed'
+        report2 = imp.import_source(self.source, relaxed, min_duration=1,
+                                    max_stationary_ms=0, max_stationary_fraction=1)
+        self.assertEqual((relaxed / report2['libraries'][0]['file']).read_bytes(), expected)
+        clip = decode(path)['clips'][0]
+        self.assertEqual(clip['frames'][0][0], 0)
+        self.assertEqual(clip['duration'], 10000)
+        self.assertEqual(clip['actions'], [(3500, 1), (6500, 2)])
+
+    def test_empty_spawn_pool_is_reported_not_replaced_with_other_spawn(self):
+        self.write(self.moving() + self.moving(1, 500, 100),
+                   [event('spawn', 0, 0), event('spawn', 1, 0, x=100)])
+        report = imp.import_source(self.source, self.output)
+        empty = next(p for p in report['quality']['pools'] if p['accepted'] == 0)
+        self.assertEqual((empty['before'], empty['rejected'], empty['spawn']), (1, 1, (100, 0, 1)))
+        self.assertEqual(len(report['libraries'][0]['pools']), 1)
+        saved = json.loads((self.output / 'manifest.json').read_text())
+        self.assertEqual(saved['quality']['rejected'], 1)
+
+    def test_all_rejected_explains_reason_and_leaves_output_unchanged(self):
+        self.write()
+        self.output.mkdir()
+        old = self.output / 'manifest.json'
+        old.write_text('existing manifest')
+        with self.assertRaisesRegex(ValueError, 'life_too_short.*existing output unchanged'):
+            imp.import_source(self.source, self.output)
+        self.assertEqual(old.read_text(), 'existing manifest')
+        self.assertEqual(list(self.output.iterdir()), [old])
+
+    def test_legacy_thresholds_can_be_requested_explicitly(self):
+        self.write([frame(0, t, 0) for t in range(0, 500, 50)], [event('spawn', 0, 0)])
+        report = imp.import_source(self.source, self.output, min_duration=500,
+                                   max_stationary_ms=0, max_stationary_fraction=1)
+        self.assertEqual(report['accepted'], 1)
+        self.assertEqual(report['quality']['clips'][0]['stationary_fraction'], 1)
+
+    def test_duplicate_rejected_clip_is_not_counted_twice_in_quality_report(self):
+        frames = self.moving() + self.moving(1, 500)
+        events = [event('spawn', 0, 0), event('spawn', 1, 0)]
+        self.write(frames, events)
+        self.write(frames, events, folder='copy')
+        report = imp.import_source(self.source, self.output)
+        self.assertEqual(report['quality']['candidates'], 2)
+        self.assertEqual(report['quality']['rejected'], 1)
+        self.assertEqual(report['rejected']['duplicate_clip'], 2)
+
+    def test_cli_defaults_and_empty_pool_warning(self):
+        self.write(self.moving() + self.moving(1, 500, 100),
+                   [event('spawn', 0, 0), event('spawn', 1, 0, x=100)])
+        result = subprocess.run([sys.executable, imp.__file__, str(self.source), str(self.output)],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('retained 1/2', result.stdout)
+        self.assertIn('WARNING: no eligible lives left', result.stderr)
+        self.assertIn('100.0', result.stderr)
+
+    def test_cli_rejects_nan_settings(self):
+        result = subprocess.run([sys.executable, imp.__file__, str(self.source), str(self.output),
+                                 '--stationary-speed', 'nan'], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('stationary_speed must be finite', result.stderr)
+
+    def test_stale_library_for_fully_filtered_map_is_not_silently_reused(self):
+        self.write(self.moving(), [event('spawn', 0, 0)])
+        self.write([frame(0, 0, 0, map='dm/short'), frame(0, 50, 1, map='dm/short')],
+                   [event('spawn', 0, 0)], folder='other', map_name='dm/short')
+        stale = self.output / 'dm/short.4294967295.1.rpl'
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b'existing library')
+        with self.assertRaisesRegex(ValueError, 'old library exists'):
+            imp.import_source(self.source, self.output)
+        self.assertEqual(stale.read_bytes(), b'existing library')
+        self.assertFalse((self.output / 'dm/test.4294967295.1.rpl').exists())
 
 
 if __name__=='__main__':

@@ -28,11 +28,13 @@ directory and filename suffix, including names such as `movement_frames (2).csv`
 Use an empty output directory when rebuilding a pack so old unreferenced libraries
 cannot be confused with the new manifest. Restart the map after replacing libraries.
 
-For the provided archive, the first-map import produced 600 human lives / 133,153
-frames in four spawn pools: 138, 188, 38 and 236 lives. These are input-specific
-validation results, not a guarantee about any other archive. Six clips required an
-explicit synthetic spawn boundary before the first observed frame. The original
-observed timestamps and positions are retained.
+For the provided archive, the default quality-filtered first-map import produces
+150 human lives / 76,800 frames in four spawn pools: 34, 45, 8 and 63 lives. The
+previous 600-life pack is reduced to those 150 unmodified lives. Two retained clips
+have an explicit synthetic spawn boundary before the first observed frame; observed
+timestamps and positions are retained. These are input-specific validation results,
+not a guarantee about other archives. The quality audit sees 601 structurally valid
+candidates, including one sub-500-ms life the old default already excluded.
 
 The resulting first-map file is:
 
@@ -49,6 +51,66 @@ Without `--map`, the importer writes each available map/checksum/game-mode libra
 The runtime still enforces its FFA/team-deathmatch and protocol-8 restrictions.
 `--include-bots` additionally imports recorded bot lives; the default is humans only.
 Metadata lacking a BSP checksum is skipped, not assigned the checksum of a newer map.
+
+## Filter out short or inactive lives
+
+Filtering is performed by the importer, not by changing playback. A rejected life
+is removed from its spawn's pool in its entirety. An accepted life's positions,
+timestamps, spawn, clip ID, weapons and actions are unchanged. Pauses are never
+fast-forwarded or cut out, and a life is never restarted from its first moving frame.
+
+The new defaults are:
+
+| Import option | Default | Rule |
+|---|---:|---|
+| `--min-duration-ms` | `10000` | Reject lives shorter than 10 seconds of available playback. |
+| `--max-stationary-ms` | `3000` | Reject any continuous stationary stretch longer than 3 seconds. Set `0` to disable this limit. |
+| `--max-stationary-fraction` | `0.60` | Reject lives stationary for more than 60% of their playback time, even in several shorter pauses. Set `1` to disable this limit. |
+| `--stationary-speed` | `10` | Horizontal game units/second at or below this threshold count as stationary. |
+
+Activity is measured from horizontal position changes divided by elapsed time,
+not recorded velocity, input buttons, aim changes, frame counts or net start/end
+distance. Strafing back and forth counts as movement. Turning, shooting, leaning,
+crouching and vertical-only jumping do not; slow drift and small positional jitter
+at or below the threshold do not reset the stationary timer. Each sample interval
+is weighted by its duration. The final held-position interval before the clip ends
+is stationary even if the recorded velocity is nonzero. Thresholds are inclusive:
+exactly 10 seconds of duration, a 3-second pause, or 60% stationary time is allowed.
+Synthetic spawn interpolation, when present, is assessed as the playback it creates.
+
+For example, explicitly select those defaults:
+
+```sh
+python tools/replay/import_recordings.py Archive.zip /path/to/new-pack/main/replays --map dm/crnodoors --min-duration-ms 10000 --max-stationary-ms 3000 --max-stationary-fraction 0.60 --stationary-speed 10
+```
+
+For more variety, a less restrictive preset is `--min-duration-ms 8000
+--max-stationary-ms 4000`. The stationary-fraction limit still applies. To restore
+the previous filtering policy, explicitly use `--min-duration-ms 500
+--max-stationary-ms 0 --max-stationary-fraction 1`.
+
+`manifest.json` now includes a `quality` section with the settings, per-clip activity
+metrics and all failure reasons, plus spawn-pool counts before and after filtering.
+Clip records contain hashed IDs, not player names. `quality.failure_counts` can
+count a life against more than one failed rule; the main `rejected` totals count
+each life only once, in duration / longest pause / total stationary time order.
+Duplicate input clips are counted only once in the quality audit.
+
+Empty spawn pools remain visible in the report and generate CLI warnings. Filters
+are never silently relaxed to populate them. Bots at uncovered spawns still hold
+and log a diagnostic rather than taking a different spawn's route. An import that
+rejects every life fails with rejection counts and leaves existing output untouched.
+Use a fresh output directory for each build: when a previously covered map is fully
+filtered out, an existing library for that map is an error, not silently reusable data.
+
+Filtering the original recordings does not fix a runtime collision-stop or missing
+spawn match. Inspect the server's `Replay bot ... holding position` diagnostic when
+a filtered clip stops unexpectedly.
+
+**No new server build is needed for these filters.** The `OMRPL001` binary format and
+engine are unchanged. Reimport or install the newly filtered `.rpl` plus manifest,
+replacing the old library, then restart the map. Merely updating the Python importer
+does not alter recordings already installed on a server.
 
 ## Start a local test
 
@@ -186,7 +248,9 @@ Validate a generated pack with the compiled test executable:
 It validates the binary format and checks every retained sample for exact playback.
 The Python suite covers segmentation, victim attribution, missing starts/checksums,
 gaps, spectator/bot filtering, duplicate sources, ZIP input, added CSV columns, unsafe
-map names, invalid numbers and event boundaries. The C++ suite also checks malformed
+map names, invalid numbers and event boundaries. Quality-filter tests cover exact
+thresholds, time-weighted inactivity, stationary tails, XY-only motion, jitter, empty
+spawn pools, stale libraries, invalid settings and unchanged accepted binary payloads. The C++ suite also checks malformed
 and truncated files, sample interpolation, action delivery, team/spawn filtering,
 busy-clip exclusion, reproducible shuffling and non-repeating pool cycles.
 
