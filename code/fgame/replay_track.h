@@ -70,13 +70,13 @@ public:
     explicit SpawnSelector(std::uint32_t seed = 1) : generator(seed) {}
     void Reset(std::uint32_t seed);
     // SIZE_MAX means uncovered/ambiguous spawn or all remaining clips in use.
-    // Teams are ignored only for FFA; positions are never translated or rotated.
-    std::size_t Select(const Library& library, const Vec3& spawn, int team, float tolerance,
+    // Recorded team/weapon are metadata, not movement eligibility. The caller
+    // supplies an already legal live spawn; positions are never transformed.
+    std::size_t Select(const Library& library, const Vec3& spawn, float tolerance,
                        const std::set<std::size_t>& busy = {});
 private:
     struct Bag {
         Vec3 spawn{};
-        int team = 0;
         std::vector<std::size_t> members, order;
         std::size_t cursor = 0, last = static_cast<std::size_t>(-1);
     };

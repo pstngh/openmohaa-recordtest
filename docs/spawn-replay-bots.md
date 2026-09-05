@@ -15,6 +15,10 @@ A server-side rebuild is required. Use this branch's dedicated server and game m
 with a normal licensed game installation and the matching map assets. No game assets
 or player recordings are distributed in this repository.
 
+The team/weapon-neutral runtime fix also requires a rebuilt game module: old builds
+still restrict team-deathmatch pools and equip recorded weapons. Existing `OMRPL001`
+replay packs are compatible; no reimport or new recording data is needed for this fix.
+
 ## Import recordings
 
 Python 3.10 or newer; no third-party Python packages are required.
@@ -148,6 +152,15 @@ missing starts, big sampling gaps, teleports and ladder clips are not joined int
 fabricated continuous route. A sampling gap retains only a usable spawn-origin prefix.
 Duplicate input clips are deduplicated.
 
+Recorded teams and weapons are metadata, not movement restrictions. In both FFA and
+team deathmatch, every compatible life anchored at the actual spawn enters one shared
+pool, regardless of which team or weapon produced it. The live game still chooses a
+legal spawn for the current team; recorded routes are not moved to other spawns.
+Enemy selection still uses the live bot's team, not the recorded player's team.
+Older importer manifests may list team-specific coverage counts; those describe the
+source recordings, not separate runtime pools. Map/checksum/mode/protocol checks
+remain in force; this does not introduce cross-game-mode playback or live stitching.
+
 At each spawn, compatible lives enter a shuffled pool. The selector consumes the pool
 before reshuffling and avoids an immediate repeat across cycles when possible. Clips
 already in use by another bot are not handed out simultaneously. If all remaining
@@ -177,12 +190,26 @@ Live aim chooses a visible enemy in the current match, with a field of view, rea
 delay, bounded turn rate and configurable aim error. It does not call the ordinary
 attack state, which can change movement. No target means returning toward recorded aim.
 
-The prototype replays sampled attack buttons, observed weapon changes and timed reload
-requests through normal weapon mechanics. The first observed weapon is prepared during
-spawn/draw time. Original shot events are stored for analysis, not fired a second time.
-Recorded damage, hits, health and kill credit are **never** applied. Ammo is initialized
-once per observed weapon, not restored every frame. Weapon availability, draw/reload
-animations and the live game determine whether a shot actually occurs.
+The live game owns the bot's assigned weapon and ammunition. Replay does not grant,
+equip or switch recorded weapons, cancel the spawn's pending weapon draw, or restore
+recorded ammunition. A live Allied sniper can follow an Axis SMG recording and remain
+an Allied sniper. Normal live loadout changes are respected. An unavailable, switching
+or reloading live weapon suppresses combat requests, not movement playback.
+
+With `g_replay_actions 1`, recorded primary-fire intent is adapted to the current
+weapon: automatic weapons receive trigger holds; semi-automatic weapons receive
+press/release edges only while their own idle/readiness rules permit. Native fire
+rate, ammo use, draw/reload animations and movement-dependent firing restrictions
+remain authoritative. The controller never stops the route to let a sniper shoot.
+It requests normal reloads only when the live weapon lacks loaded ammunition and
+can reload; it does not inject ammo or replay the donor's reload schedule.
+
+Recorded weapon changes, secondary fire/melee/scope inputs, zoom state and shot/reload
+events remain in the data for analysis but do not execute combat actions. In particular,
+a donor's scope press cannot become a melee attack on an SMG. This version does not
+automatically scope a live sniper based on donor input. Existing live scope state is
+left to the native weapon system. Recorded damage, health and kill credit are never
+applied. `g_replay_actions 0` suppresses all replay fire/reload requests.
 
 `USE` input is deliberately not executed: with a different aim it could attach the bot
 to the wrong ladder, turret or vehicle. The original world is not being replayed.
@@ -214,7 +241,7 @@ some orientation/animation. The library is immutable; targeting does not edit it
 |---|---:|---|
 | `g_replay_bots` | `0` | Enable replay-controlled multiplayer bots. Set before map/spawn. |
 | `g_replay_aim` | `1` | Retarget visible live enemies; `0` uses recorded angles. |
-| `g_replay_actions` | `1` | Sampled firing, weapon selection and reload requests; `0` disables combat requests. |
+| `g_replay_actions` | `1` | Adapt primary-fire intent to the live weapon and reload on live ammo need; `0` disables requests. |
 | `g_replay_debug` | `0` | Log selected clip and end-of-frame position checks each replay tick. |
 | `g_replay_spawn_tolerance` | `8` | Spawn-match radius, bounded to 0..32 units. Multiple distinct matching anchors are rejected. |
 | `g_replay_turn_speed` | `360` | Maximum aiming turn speed in degrees/second. |
@@ -251,8 +278,10 @@ gaps, spectator/bot filtering, duplicate sources, ZIP input, added CSV columns, 
 map names, invalid numbers and event boundaries. Quality-filter tests cover exact
 thresholds, time-weighted inactivity, stationary tails, XY-only motion, jitter, empty
 spawn pools, stale libraries, invalid settings and unchanged accepted binary payloads. The C++ suite also checks malformed
-and truncated files, sample interpolation, action delivery, team/spawn filtering,
-busy-clip exclusion, reproducible shuffling and non-repeating pool cycles.
+and truncated files, sample interpolation, action delivery, team/weapon-neutral spawn pools,
+busy-clip exclusion, reproducible shuffling and non-repeating pool cycles. The live
+combat policy tests cover automatic holds, semi-auto releases, native readiness,
+draw/switch waits, empty versus partial magazines, disable/reset and immutable samples.
 
 Full server/game build (requires the project's normal build dependencies):
 
@@ -261,7 +290,7 @@ cmake -S . -B build-replay -DCMAKE_BUILD_TYPE=Debug -DBUILD_CLIENT=OFF -DBUILD_R
 cmake --build build-replay --parallel 2
 ```
 
-The `Replay validation` workflow runs both test suites and the server/game build.
+The `Replay validation` workflow runs the replay, importer and live-combat test suites and the server/game build.
 Automated sampling and compilation do not substitute for an in-game smoke test with
 the original assets. Validate collision, visible animation, weapon timing, death,
 respawn and pool selection on the target installation before increasing bot count.

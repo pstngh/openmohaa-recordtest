@@ -238,7 +238,7 @@ void SpawnSelector::Reset(std::uint32_t seed) {
     generator.seed(seed);
 }
 
-std::size_t SpawnSelector::Select(const Library& library, const Vec3& spawn, int team, float tolerance,
+std::size_t SpawnSelector::Select(const Library& library, const Vec3& spawn, float tolerance,
                                  const std::set<std::size_t>& busy) {
     if (!std::isfinite(tolerance) || tolerance < 0 || tolerance > 32) return noClip;
     for (float coordinate : spawn) if (!std::isfinite(coordinate)) return noClip;
@@ -247,7 +247,6 @@ std::size_t SpawnSelector::Select(const Library& library, const Vec3& spawn, int
     bool found = false;
     for (std::size_t i = 0; i < library.clips.size(); ++i) {
         const auto& clip = library.clips[i];
-        if (library.gameType != 1 && clip.team != team) continue;
         if (DistanceSquared(spawn, clip.spawn) > tolerance * tolerance) continue;
         // Never collapse two distinct nearby spawn points into one pool.
         if (found && DistanceSquared(anchor, clip.spawn) > 0.0001f) return noClip;
@@ -256,12 +255,11 @@ std::size_t SpawnSelector::Select(const Library& library, const Vec3& spawn, int
         matches.push_back(i);
     }
     if (!found) return noClip;
-    const int poolTeam = library.gameType == 1 ? 0 : team;
     auto bag = std::find_if(bags.begin(), bags.end(), [&](const Bag& b) {
-        return b.team == poolTeam && b.spawn == anchor && b.members == matches;
+        return b.spawn == anchor && b.members == matches;
     });
     if (bag == bags.end()) {
-        bags.push_back({anchor, poolTeam, matches, {}, 0, noClip});
+        bags.push_back({anchor, matches, {}, 0, noClip});
         bag = bags.end() - 1;
     }
     if (bag->cursor == bag->order.size()) {

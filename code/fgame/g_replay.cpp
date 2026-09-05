@@ -6,6 +6,7 @@
  */
 #include "g_replay.h"
 #include "replay_track.h"
+#include "replay_combat.h"
 #include "g_local.h"
 #include "g_main.h"
 #include "g_phys.h"
@@ -37,8 +38,9 @@ struct ReplayState {
     int born = 0, lastTime = 0, noticed = 0;
     int savedMoveType = MOVETYPE_WALK, savedContents = CONTENTS_BODY;
     int savedFlags = 0;
-    std::size_t clip = noClip, actionCursor = 0;
-    std::set<std::uint32_t> stocked;
+    std::size_t clip = noClip;
+    SafePtr<Weapon> combatWeapon;
+    replay::CombatController combat;
     bool eligible = false, tried = false, locked = false, finished = false;
 };
 
@@ -125,7 +127,7 @@ bool LoadLibrary() {
         return false;
     }
     const int fps = gi.Cvar_Get("sv_fps", "20", 0)->integer;
-    if (fps <= 0 || 1000 % fps || 1000 / fps != static_cast<int>(data.library.sampleMsec)) {
+    if (fps <= 0 || 1000 % fps || 1000 / fps != static_cast<int>(replayWorld->library.sampleMsec)) {
         gi.Printf("Replay: sv_fps must match recording sample interval %u ms; restart map after changing it.\n",
                   data.library.sampleMsec);
         return false;
@@ -136,41 +138,30 @@ bool LoadLibrary() {
     return true;
 }
 
-// Never interpret a recording's weapon name as an executable console command or arbitrary asset path.
-const char *WeaponModel(const std::string& name) {
-    static const std::pair<const char *, const char *> models[] = {
-        {"Thompson", "thompsonsmg"}, {"MP40", "mp40"}, {"M1 Garand", "m1_garand"},
-        {"Kar98", "kar98"}, {"Springfield '03 Sniper", "springfield"},
-        {"Kar98 Sniper", "kar98sniper"}, {"BAR", "bar"}, {"StG 44", "mp44"},
-        {"MP44", "mp44"}, {"Bazooka", "bazooka"}, {"Panzerschreck", "panzerschreck"},
-        {"Shotgun", "shotgun"}, {"Colt 45", "colt45"}, {"Colt .45", "colt45"}, {"Walther P38", "p38"},
-        {"Frag Grenade", "m2frag_grenade"}, {"Stielhandgranate", "steilhandgranate"}
-    };
-    for (const auto& entry : models) if (!Q_stricmp(name.c_str(), entry.first)) return entry.second;
-    return nullptr;
-}
-
-bool Equip(Player *p, ReplayState& state, const replay::Clip& clip, std::uint32_t index) {
-    const auto& recorded = clip.weapons[index];
-    if (recorded.name.empty()) return true;
-    Item *item = p->FindItemByExternalName(recorded.name.c_str());
-    if (!item) {
-        const char *model = WeaponModel(recorded.name);
-        if (!model) return false;
-        item = p->giveItem(va("models/weapons/%s.tik", model));
+// Combat adapts only the primary-fire intent to the live loadout. Recorded
+// weapon names, ammunition, reloads and secondary actions never mutate it.
+replay::CombatRequest Combat(Player *p, ReplayState& state) {
+    Weapon *weapon = p->GetActiveWeapon(WEAPON_MAIN);
+    if (state.combatWeapon.Pointer() != weapon) {
+        state.combatWeapon = weapon;
+        state.combat.Reset();
     }
-    if (!item || !item->isSubclassOf(Weapon)) return false;
-    Weapon *weapon = static_cast<Weapon *>(item);
-    if (state.stocked.insert(index).second) {
-        if (recorded.clipAmmo >= 0) weapon->SetAmmoAmount(std::min(recorded.clipAmmo, weapon->GetClipSize(FIRE_PRIMARY)), FIRE_PRIMARY);
-        if (recorded.reserveAmmo >= 0) {
-            const str type = weapon->GetAmmoType(FIRE_PRIMARY);
-            p->UseAmmo(type, p->AmmoCount(type));
-            p->GiveAmmo(type, recorded.reserveAmmo);
-        }
+    replay::LiveWeaponInput live;
+    const bool playable = actionsEnabled->integer && state.clip != noClip && !state.finished;
+    if (playable && weapon && !p->GetNewActiveWeapon()) {
+        const auto weaponState = weapon->GetState();
+        live.active = weaponState == WEAPON_READY || weaponState == WEAPON_FIRING;
+        live.semiAutomatic = weapon->IsSemiAuto();
+        const int animation = p->client->ps.iViewModelAnim;
+        live.idle = weaponState == WEAPON_READY && (animation == VM_ANIM_IDLE
+            || (animation >= VM_ANIM_IDLE_0 && animation <= VM_ANIM_IDLE_2));
+        live.ammoInClip = weapon->HasAmmoInClip(FIRE_PRIMARY);
+        live.canReload = weaponState == WEAPON_READY && weapon->CheckReload(FIRE_PRIMARY);
+        // ReadyToFire enforces the equipped weapon's delay and movement limits.
+        // Automatic weapons keep the trigger held; the native state machine gates shots.
+        live.canFire = live.semiAutomatic && live.idle && weapon->ReadyToFire(FIRE_PRIMARY, qfalse);
     }
-    if (p->GetActiveWeapon(WEAPON_MAIN) != weapon && p->GetNewActiveWeapon() != weapon) p->useWeapon(weapon);
-    return true;
+    return state.combat.Update(playable, (state.frame.buttons & BUTTON_ATTACKLEFT) != 0, live);
 }
 
 bool PathClear(Player *p, const replay::Vec3& from, const replay::Frame& frame) {
@@ -357,21 +348,13 @@ bool G_ReplayBuildCommand(Player *p, usercmd_t *cmd, usereyes_t *eyes) {
         } else {
             std::set<std::size_t> busy;
             for (const auto& entry : replayWorld->states) if (entry.second.owner && entry.second.clip != noClip) busy.insert(entry.second.clip);
-            state.clip = replayWorld->selector.Select(replayWorld->library, state.spawn, p->GetTeam(), spawnTolerance->value, busy);
+            state.clip = replayWorld->selector.Select(replayWorld->library, state.spawn, spawnTolerance->value, busy);
             if (state.clip == noClip) Hold(state, "uncovered/ambiguous spawn or spawn pool currently exhausted");
             else {
                 const auto& clip = replayWorld->library.clips[state.clip];
                 state.aim = Unpacked(clip.frames.front().angles);
                 p->CancelEventsOfType(EV_SetViewangles);
-                if (actionsEnabled->integer) {
-                    p->CancelEventsOfType(EV_Sentient_UseItem);
-                    for (std::uint32_t i = 0; i < clip.weapons.size(); ++i) {
-                        if (clip.weapons[i].name.empty()) continue;
-                        // Prepare the first recorded weapon during spawn/draw time, not after its first shot.
-                        if (!Equip(p, state, clip, i)) Hold(state, "initial recorded weapon unavailable");
-                        break;
-                    }
-                }
+                // Leave the live spawn's pending weapon draw/loadout events intact.
                 gi.Printf("Replay bot %d: clip %s at (%.3f %.3f %.3f), %u ms\n", p->entnum,
                     clip.id.c_str(), clip.spawn[0], clip.spawn[1], clip.spawn[2], clip.duration);
             }
@@ -410,13 +393,6 @@ bool G_ReplayBuildCommand(Player *p, usercmd_t *cmd, usereyes_t *eyes) {
             if (!clear) Hold(state, "recorded path blocked by the current world");
             else {
                 state.frame = next;
-                if (actionsEnabled->integer && !Equip(p, state, clip, state.frame.weapon)) Hold(state, "recorded weapon is unavailable/unsupported");
-                if (state.clip != noClip) {
-                    for (const auto& action : replay::DueActions(clip, state.actionCursor, elapsed)) {
-                        if (actionsEnabled->integer && action.kind == replay::Action::Reload) p->PlayerReload(nullptr);
-                        // Shot events are diagnostics, NOT duplicate fire requests or recorded damage.
-                    }
-                }
             }
         }
     }
@@ -429,9 +405,11 @@ bool G_ReplayBuildCommand(Player *p, usercmd_t *cmd, usereyes_t *eyes) {
     cmd->forwardmove = state.frame.forward;
     cmd->rightmove = state.frame.right;
     cmd->upmove = state.frame.up;
-    // USE is intentionally disabled: a new aim direction must not attach to a ladder/vehicle or use the wrong object.
-    cmd->buttons = state.frame.buttons & ~BUTTON_USE;
-    if (!actionsEnabled->integer || state.finished) cmd->buttons &= ~(BUTTON_ATTACKLEFT | BUTTON_ATTACKRIGHT);
+    // Preserve locomotion inputs, not donor-specific USE, scope, melee or fire modes.
+    cmd->buttons = state.frame.buttons & ~(BUTTON_USE | BUTTON_ATTACKLEFT | BUTTON_ATTACKRIGHT);
+    const auto combat = Combat(p, state);
+    if (combat.reload) p->PlayerReload(nullptr);
+    if (combat.primary) cmd->buttons |= BUTTON_ATTACKLEFT;
     for (int i = 0; i < 3; ++i) {
         cmd->angles[i] = ANGLE2SHORT(state.aim[i]) - p->client->ps.delta_angles[i];
         eyes->ofs[i] = static_cast<signed char>(std::clamp(state.frame.eyeOffset[i], -127.0f, 127.0f));

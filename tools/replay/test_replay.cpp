@@ -83,24 +83,48 @@ void CoreTests() {
     for (int cycle=0;cycle<20;++cycle) {
         std::set<std::size_t> seen;
         for (int n=0;n<5;++n) {
-            const auto choice=selector.Select(lib,c.spawn,4,1);
-            Check(choice==equal.Select(lib,c.spawn,4,1),"seed must reproduce selection sequence");
+            const auto choice=selector.Select(lib,c.spawn,1);
+            Check(choice==equal.Select(lib,c.spawn,1),"seed must reproduce selection sequence");
             Check(choice<5 && choice!=last,"invalid choice or immediate repetition");
             Check(seen.insert(choice).second,"repeat before shuffled pool exhausted");
             last=choice;
         }
     }
     const auto none=static_cast<std::size_t>(-1);
-    Check(selector.Select(lib,{500,0,1},3,8)==none,"wrong spawn selected");
-    Check(selector.Select(lib,c.spawn,3,33)==none,"unsafe tolerance accepted");
-    Check(selector.Select(lib,{std::numeric_limits<float>::quiet_NaN(),0,1},3,8)==none,"NaN spawn accepted");
+    Check(selector.Select(lib,{500,0,1},8)==none,"wrong spawn selected");
+    Check(selector.Select(lib,c.spawn,33)==none,"unsafe tolerance accepted");
+    Check(selector.Select(lib,{std::numeric_limits<float>::quiet_NaN(),0,1},8)==none,"NaN spawn accepted");
     selector.Reset(3);
-    Check(selector.Select(lib,c.spawn,3,1,{0,1,2,3,4})==none,"busy clips selected");
-    Check(selector.Select(lib,c.spawn,3,1,{0,1,2,3})==4,"busy pool recovery");
+    Check(selector.Select(lib,c.spawn,1,{0,1,2,3,4})==none,"busy clips selected");
+    Check(selector.Select(lib,c.spawn,1,{0,1,2,3})==4,"busy pool recovery");
     repeated.spawn[0]+=3; lib.clips.push_back(repeated);
-    Check(selector.Select(lib,c.spawn,3,8)==none,"ambiguous anchors merged");
-    lib.gameType=2;
-    Check(selector.Select(lib,c.spawn,4,1)==none,"team restriction ignored");
+    Check(selector.Select(lib,c.spawn,8)==none,"ambiguous anchors merged");
+    // Team and weapon metadata cannot partition a shared spawn pool in either mode.
+    lib.clips.pop_back(); // Remove the deliberately ambiguous anchor above.
+    for (int mode : {1, 2}) {
+        lib.gameType = mode;
+        for (std::size_t i = 0; i < lib.clips.size(); ++i) {
+            lib.clips[i].team = i % 2 ? 3 : 4;
+            lib.clips[i].weapons[0].name = i % 2 ? "MP40" : "Springfield '03 Sniper";
+        }
+        selector.Reset(10);
+        for (int cycle = 0; cycle < 5; ++cycle) {
+            std::set<std::size_t> seen;
+            for (std::size_t i = 0; i < lib.clips.size(); ++i) {
+                const auto choice = selector.Select(lib, c.spawn, 1);
+                Check(choice < lib.clips.size(), "cross-team/weapon life excluded");
+                Check(seen.insert(choice).second, "separate team bags repeat before shared pool exhaustion");
+                Check(replay::Sample(lib.clips[choice], 50).origin == c.frames[1].origin,
+                      "loadout-neutral selection changed a movement sample");
+            }
+        }
+        selector.Reset(3);
+        Check(selector.Select(lib, c.spawn, 1, {0, 1, 2, 3}) == 4, "cross-team busy exclusion");
+        repeated.team = 4;
+        lib.clips.push_back(repeated);
+        Check(selector.Select(lib, c.spawn, 8) == none, "cross-team ambiguous anchors merged");
+        lib.clips.pop_back();
+    }
     std::cout << "Core replay tests passed (parser, exact sampling, event timing, spawn pools).\n";
 }
 void VerifyFile(const char *name) {
