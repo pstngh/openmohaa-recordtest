@@ -33,6 +33,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "weaputils.h"
 #include "windows.h"
 #include "g_bot.h"
+#include "g_imitation.h"
 
 // We assume that we have limited access to the server-side
 // and that most logic come from the playerstate_s structure
@@ -81,6 +82,7 @@ BotController::BotController()
 
 BotController::~BotController()
 {
+    G_ImitationForget(controlledEnt);
     if (controlledEnt) {
         controlledEnt->delegate_gotKill.Remove(delegateHandle_gotKill);
         controlledEnt->delegate_killed.Remove(delegateHandle_killed);
@@ -1202,6 +1204,7 @@ void BotController::UseWeaponWithAmmo()
 
 void BotController::Spawned(void)
 {
+    G_ImitationForget(controlledEnt);
     ClearEnemy();
     m_iCuriousTime   = 0;
     m_botCmd.buttons = 0;
@@ -1212,15 +1215,18 @@ void BotController::Think()
     usercmd_t  ucmd;
     usereyes_t eyeinfo;
 
-    UpdateBotStates();
-    GetUsercmd(&ucmd);
-    GetEyeInfo(&eyeinfo);
+    if (!G_ImitationBuildCommand(controlledEnt, &ucmd, &eyeinfo)) {
+        UpdateBotStates();
+        GetUsercmd(&ucmd);
+        GetEyeInfo(&eyeinfo);
+    }
 
     G_ClientThink(controlledEnt->edict, &ucmd, &eyeinfo);
 }
 
 void BotController::Killed(const Event& ev)
 {
+    G_ImitationForget(controlledEnt);
     Entity *attacker;
 
     // send the respawn buttons
@@ -1352,6 +1358,7 @@ BotControllerManager::~BotControllerManager()
 
 void BotControllerManager::Init()
 {
+    G_ImitationInit();
     BotController::Init();
 }
 
@@ -1367,6 +1374,7 @@ void BotControllerManager::Cleanup()
     }
 
     controllers.FreeObjectList();
+    G_ImitationShutdown();
 }
 
 void BotControllerManager::ThinkControllers()
