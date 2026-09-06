@@ -4,6 +4,7 @@
  */
 #include "g_imitation.h"
 #include "imitation_policy.h"
+#include "imitation_runtime.h"
 #include "g_main.h"
 #include "player.h"
 #include "weapon.h"
@@ -13,14 +14,19 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <sstream>
 
 namespace {
 cvar_t *enabled, *modelPath, *debug, *actions, *reactionMsec, *seed, *sampling;
 struct ImitationState {
     std::mt19937 generator;
+    std::uint32_t sequence = 0;
     SafePtr<Player> owner;
     imitation::Hidden memory{};
-    usercmd_t previous{};
+    imitation::ControlFeedback feedback;
+    usercmd_t cachedCommand{};
+    usereyes_t cachedEyes{};
+    bool hasTick = false;
     Vector lastView;
     int lastTime = 0, lastLog = 0, noticed = 0;
     SafePtr<Player> visibleEnemy;
@@ -32,6 +38,7 @@ struct ImitationWorld {
     imitation::Policy policy;
     std::map<Player*,ImitationState> states;
     bool attempted = false, available = false;
+    std::uint32_t modelId = 0;
 };
 std::unique_ptr<ImitationWorld> data;
 
@@ -96,11 +103,18 @@ bool Load() {
     const long read=gi.FS_ReadFile(modelPath->string,&bytes,qtrue);
     std::string error;
     const bool valid=read==length && data->policy.Load(bytes,length,error);
+    if(valid) {
+        // Diagnostic fingerprint only, not a security/integrity checksum.
+        data->modelId=2166136261u;
+        const auto *raw=static_cast<const unsigned char*>(bytes);
+        for(long i=0;i<read;++i)data->modelId=(data->modelId^raw[i])*16777619u;
+    }
     if(bytes)gi.FS_FreeFile(bytes);
     if(!valid) {
         gi.Printf("Imitation model rejected: %s. Native bots remain active.\n",error.c_str());return false;
     }
     gi.Printf("Imitation: loaded mohdm6 GRU policy %s; native physics, no replay or tactical planner. Experimental, not gameplay-validated.\n",modelPath->string);
+    gi.Printf("Imitation runtime feedback-v2: model_id=%08x decoder=%s\n",data->modelId,sampling->integer?"sampled":"MAP");
     data->available=true;return true;
 }
 } // namespace
@@ -121,7 +135,8 @@ void G_ImitationShutdown() {data.reset();}
 void G_ImitationForget(Player *p) {if(data)data->states.erase(p);}
 
 bool G_ImitationBuildCommand(Player *p,usercmd_t *command,usereyes_t *eyes) {
-    if(!data || !enabled || !enabled->integer || !p || !p->client)return false;
+    if(!data || !enabled || !p || !p->client)return false;
+    if(!enabled->integer) {G_ImitationForget(p);return false;}
     if(p->IsDead() || p->IsSpectator() || p->GetTeam()<TEAM_FREEFORALL || level.intermissiontime) {
         G_ImitationForget(p);return false; // Native lifecycle owns real death/team/respawn.
     }
@@ -129,16 +144,23 @@ bool G_ImitationBuildCommand(Player *p,usercmd_t *command,usereyes_t *eyes) {
     if(!Load())return false;
     auto& state=data->states[p];
     if(state.owner.Pointer()!=p) {state=ImitationState{};state.owner=p;state.lastView=p->GetViewAngles();
-        state.generator.seed(static_cast<std::uint32_t>(seed->integer) ^ (++data->spawnCounter*2654435761u) ^ p->entnum);}
+        state.sequence=++data->spawnCounter;
+        state.generator.seed(static_cast<std::uint32_t>(seed->integer) ^ (state.sequence*2654435761u) ^ p->entnum);}
     *command={};*eyes={};command->serverTime=level.svsTime;
     Vector current=p->GetViewAngles();
-    const int dt=state.lastTime?level.inttime-state.lastTime:20;
-    if(dt<0 || dt>100) {state.memory={};state.previous={};state.primaryDown=false;}
+    const std::int64_t elapsed=imitation::Elapsed(state.hasTick,state.lastTime,level.inttime);
+    if(state.hasTick && elapsed==0) {
+        *command=state.cachedCommand;*eyes=state.cachedEyes;return true;
+    }
+    const bool reset=imitation::Discontinuous(elapsed);
+    const int dt=reset?int(imitation::tickMsec):static_cast<int>(elapsed);
+    if(reset) {state.memory={};state.feedback.Reset();state.primaryDown=false;state.lastView=current;}
     // Attachments/script freezes are not training states; release controls rather than teleporting.
     if(p->HasVehicle() || p->GetTurret() || p->GetLadder() || p->m_bFrozen || level.playerfrozen) {
-        state.memory={};state.previous={};state.lastView=current;state.lastTime=level.inttime;
+        state.memory={};state.feedback.Reset();state.primaryDown=false;state.lastView=current;state.lastTime=level.inttime;
         for(int i=0;i<3;++i)command->angles[i]=ANGLE2SHORT(current[i])-p->client->ps.delta_angles[i];
-        eyes->ofs[2]=p->viewheight;eyes->angles[0]=current[0];eyes->angles[1]=current[1];return true;
+        eyes->ofs[2]=p->viewheight;eyes->angles[0]=current[0];eyes->angles[1]=current[1];
+        state.hasTick=true;state.cachedCommand=*command;state.cachedEyes=*eyes;return true;
     }
     try {
         imitation::Observation observation;
@@ -154,28 +176,23 @@ bool G_ImitationBuildCommand(Player *p,usercmd_t *command,usereyes_t *eyes) {
             observation.clipAmmo=weapon->ClipAmmo(FIRE_PRIMARY);
             observation.reserveAmmo=weapon->AmmoAvailable(FIRE_PRIMARY);
         }
-        observation.previousMove={state.previous.forwardmove,state.previous.rightmove,state.previous.upmove};
-        observation.previousButtons=state.previous.buttons;
-        if(dt>0 && dt<=100 && state.lastTime)for(int i=0;i<2;++i)
+        observation.previousMove={state.feedback.intent.forward,state.feedback.intent.right,state.feedback.intent.up};
+        observation.previousButtons=state.feedback.intent.buttons;
+        if(!reset && dt>0 && dt<=100 && state.hasTick)for(int i=0;i<2;++i)
             observation.previousViewDelta[i]=imitation::AngleDelta(state.lastView[i],current[i])*20.f/dt;
         const Target observed=Observe(p,current,12);
         observation.target=observed.player!=nullptr;observation.targetDistance=observed.distance;
         if(observed.player)for(int i=0;i<3;++i) {
             observation.targetRelative[i]=observed.relative[i];observation.targetVelocity[i]=observed.player->velocity[i];
         }
-        const auto logits=data->policy.Step(imitation::Encode(observation),state.memory);
-        std::array<int,4> previous={
-            (observation.previousMove[0]/127+1)*3+observation.previousMove[1]/127+1,
-            observation.previousMove[2]/127+1,
-            (observation.previousButtons&16)?0:(observation.previousButtons&32)?2:1,
-            ((observation.previousButtons&4)?1:0) | ((observation.previousButtons&1)?2:0)
-                | ((observation.previousButtons&2)?4:0) | int(observation.previousButtons&8)};
+        const auto encoded=imitation::Encode(observation);
+        const auto logits=data->policy.Step(encoded,state.memory);
+        const auto previous=imitation::PreviousCategories(observation);
         std::array<float,5> uniform{};
         for(float& u:uniform)u=float(state.generator()>>8)*(1.f/16777216.f);
         const auto predicted=sampling->integer ? data->policy.Choose(logits,previous,uniform) : imitation::Decode(logits);
-        Vector desired=current;
-        desired[0]=std::clamp(imitation::AngleDelta(0,current[0])+predicted.pitchDelta,-89.f,89.f);
-        desired[1]+=predicted.yawDelta;desired[2]=0;
+        const auto view=imitation::CommandView(current[0],current[1],predicted,dt);
+        Vector desired(view[0],view[1],view[2]);
         command->forwardmove=predicted.forward;command->rightmove=predicted.right;command->upmove=predicted.up;
         command->buttons=predicted.buttons;
         // No routine points the camera toward an enemy: only the policy changes desired.
@@ -202,12 +219,30 @@ bool G_ImitationBuildCommand(Player *p,usercmd_t *command,usereyes_t *eyes) {
         for(int i=0;i<3;++i)command->angles[i]=ANGLE2SHORT(desired[i])-p->client->ps.delta_angles[i];
         eyes->ofs[2]=static_cast<signed char>(std::clamp(p->viewheight,-127,127));
         eyes->angles[0]=desired[0];eyes->angles[1]=desired[1];
-        state.previous=*command;state.lastView=current;state.lastTime=level.inttime;
+        // The model's history is its requested control, not the guard's denied
+        // fire request. The actually sent command is cached/logged separately.
+        state.feedback.Record(predicted,command->buttons);
+        state.lastView=current;state.lastTime=level.inttime;state.hasTick=true;
+        state.cachedCommand=*command;state.cachedEyes=*eyes;
         if(debug->integer && level.inttime-state.lastLog>=1000) {
-            gi.Printf("imitation_control bot=%d pos=%.2f,%.2f,%.2f cmd=%d,%d,%d look_delta=%.3f,%.3f mode=%d mode_weight=%.3f visible=%d firing=%d\n",
+            gi.Printf("imitation_control bot=%d pos=%.2f,%.2f,%.2f cmd=%d,%d,%d look_delta=%.3f,%.3f mode=%d mode_weight=%.3f pitch=%.2f yaw=%.2f visible=%d aligned=%d requested_fire=%d permitted=%d sent_fire=%d\n",
                 p->entnum,p->origin[0],p->origin[1],p->origin[2],command->forwardmove,command->rightmove,command->upmove,
-                predicted.pitchDelta,predicted.yawDelta,predicted.component,predicted.mixtureWeight,visible.player!=nullptr,primary);
+                predicted.pitchDelta,predicted.yawDelta,predicted.component,predicted.mixtureWeight,current[0],current[1],
+                visible.player!=nullptr,aligned.player!=nullptr,(predicted.buttons&BUTTON_ATTACKLEFT)!=0,fire,primary);
             state.lastLog=level.inttime;
+        }
+        if(debug->integer>=2) {
+            std::ostringstream line;
+            line.precision(9);
+            line << "imitation_frame bot=" << p->entnum << " time=" << level.inttime
+                 << " sequence=" << state.sequence << " model_id=" << data->modelId << " dt=" << dt << " reset=" << reset
+                 << " pitch=" << current[0] << " yaw=" << current[1]
+                 << " requested=" << predicted.forward << ',' << predicted.right << ',' << predicted.up << ',' << predicted.buttons
+                 << " sent_buttons=" << command->buttons << " view_delta=" << predicted.pitchDelta << ',' << predicted.yawDelta
+                 << " visible=" << (visible.player!=nullptr) << " aligned=" << (aligned.player!=nullptr)
+                 << " permitted=" << fire << " weapon_class=" << observation.weaponClass << " obs=";
+            for(std::size_t i=0;i<encoded.size();++i) {if(i)line << ',';line << encoded[i];}
+            line << '\n';gi.Printf("%s",line.str().c_str());
         }
         return true;
     }catch(const std::exception& e) {
